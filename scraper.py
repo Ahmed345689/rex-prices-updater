@@ -9,7 +9,7 @@ from datetime import datetime
 logging.basicConfig(level=logging.INFO, format='[%(asctime)s] %(levelname)s: %(message)s')
 logger = logging.getLogger(__name__)
 
-SCRAPER_URL = "https://www.fcrenderz.com"
+SCRAPER_URL = "https://renderz.app/players"
 MAX_RETRIES = 3
 RETRY_DELAY = 2
 
