@@ -1,0 +1,23 @@
+name: Update Players JSON
+on:
+  schedule:
+    - cron: '0 */6 * * *'
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  update-players:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install cloudscraper beautifulsoup4 lxml
+      - run: python scraper.py
+      - run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add players.json players_backup.json
+          git diff --staged --quiet || git commit -m "Update players - $(date -u +'%Y-%m-%d %H:%M') UTC"
+          git push
