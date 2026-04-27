@@ -1,6 +1,4 @@
-            fut = pending.pop(int(current), None)
-            if fut and not fut.done():
-                """
+
 Scrape https://renderz.app/24/players using Playwright.
 
 Why Playwright?
