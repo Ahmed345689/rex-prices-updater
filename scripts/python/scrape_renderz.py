@@ -1,5 +1,30 @@
 """
 Scrape https://renderz.app/24/players using Playwright.
+
+Why Playwright?
+The site is a SvelteKit app. The player list is fetched via
+`POST /api/players/filter`, which is gated by a custom `x-secure-token`
+handshake. Reproducing that handshake in pure `requests` is fragile,
+so we let a real browser perform it and we just intercept the JSON.
+
+Strategy:
+  1. Launch headless Chromium with stealth tweaks (the site has bot
+     protection that otherwise serves a challenge page on CI IPs).
+  2. Subscribe to `page.on("response", ...)` and capture every JSON body
+     whose URL matches `/api/players/filter`.
+  3. Navigate to /24/players, wait for networkidle + the first response.
+  4. For each subsequent page, navigate to `?page=N&sortDirection=DESC&sortType=rating`
+     which triggers a new POST /api/players/filter. Capture the response.
+  5. Stop at `pageData.pageCount` or `MAX_PAGES`.
+  6. Extract `name` + `price` for every player and write `players.json`.
+
+Env vars:
+  OUTPUT_FILE          (default: players.json)
+  MAX_PAGES            (default: 0 = all)
+  HEADLESS             (default: 1)
+  NAV_TIMEOUT_MS       (default: 90000)
+  RESPONSE_TIMEOUT_S   (default: 90)
+  DEBUG                (default: 0; when 1, prints every response URL)
 """
 
 from __future__ import annotations
@@ -12,15 +37,49 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from playwright.async_api import async_playwright, Response, TimeoutError as PlaywrightTimeoutError
+from playwright.async_api import (
+    async_playwright,
+    Response,
+    TimeoutError as PlaywrightTimeoutError,
+)
 
 URL = "https://renderz.app/24/players"
 API_PATH = "/api/players/filter"
 OUTPUT_FILE = Path(os.environ.get("OUTPUT_FILE", "players.json"))
-MAX_PAGES = int(os.environ.get("MAX_PAGES", "0"))  # 0 = unlimited
-NAV_TIMEOUT_MS = int(os.environ.get("NAV_TIMEOUT_MS", "60000"))
-RESPONSE_TIMEOUT_S = float(os.environ.get("RESPONSE_TIMEOUT_S", "45"))
+MAX_PAGES = int(os.environ.get("MAX_PAGES", "0"))
+NAV_TIMEOUT_MS = int(os.environ.get("NAV_TIMEOUT_MS", "90000"))
+RESPONSE_TIMEOUT_S = float(os.environ.get("RESPONSE_TIMEOUT_S", "90"))
 HEADLESS = os.environ.get("HEADLESS", "1") not in ("0", "false", "False", "")
+DEBUG = os.environ.get("DEBUG", "0") not in ("0", "false", "False", "")
+
+# Realistic, current Chrome UA. Update yearly.
+USER_AGENT = (
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
+)
+
+# JS injected before any page script runs. Hides the most obvious
+# automation signals that headless Chromium leaks by default.
+STEALTH_JS = r"""
+Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+Object.defineProperty(navigator, 'languages', {get: () => ['en-US', 'en']});
+Object.defineProperty(navigator, 'plugins', {
+  get: () => [1, 2, 3, 4, 5].map(() => ({}))
+});
+window.chrome = window.chrome || { runtime: {} };
+const origQuery = window.navigator.permissions && window.navigator.permissions.query;
+if (origQuery) {
+  window.navigator.permissions.query = (p) =>
+    p && p.name === 'notifications'
+      ? Promise.resolve({ state: Notification.permission })
+      : origQuery(p);
+}
+"""
+
+
+# ---------------------------------------------------------------------------
+# Schema-tolerant name + price extraction
+# ---------------------------------------------------------------------------
 
 NAME_KEYS = (
     "name", "commonName", "displayName", "fullName",
@@ -82,16 +141,24 @@ def extract_price(record: dict) -> int | None:
         return None
 
 
+# ---------------------------------------------------------------------------
+# Main scrape
+# ---------------------------------------------------------------------------
+
 async def scrape() -> dict:
     captured: dict[int, dict] = {}
     pending: dict[int, asyncio.Future] = {}
+    seen_urls: list[str] = []
 
     async def handle_response(response: Response) -> None:
         try:
-            if API_PATH not in response.url or response.request.method != "POST":
+            url = response.url
+            if DEBUG:
+                seen_urls.append(f"{response.request.method} {response.status} {url}")
+            if API_PATH not in url or response.request.method != "POST":
                 return
             if response.status != 200:
-                print(f"[response] {response.status} {response.url}")
+                print(f"[response] {response.status} {url}")
                 return
             try:
                 body = await response.json()
@@ -100,42 +167,78 @@ async def scrape() -> dict:
                 return
 
             page_data = body.get("pageData") or {}
-            current = page_data.get("currentPage") or 1
+            current = int(page_data.get("currentPage") or 1)
             total_pages = page_data.get("pageCount") or 1
             row_count = page_data.get("rowCount")
             players = body.get("players") or []
             print(f"[response] page {current}/{total_pages}, "
                   f"{len(players)} players, total={row_count}")
-            captured[int(current)] = body
-            fut = pending.pop(int(current), None)
+            captured[current] = body
+            fut = pending.pop(current, None)
             if fut and not fut.done():
                 fut.set_result(body)
         except Exception as e:
             print(f"[response] handler error: {e}")
 
     async with async_playwright() as pw:
-        browser = await pw.chromium.launch(headless=HEADLESS)
-        context = await browser.new_context(
-            user_agent=(
-                "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-                "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-            ),
-            locale="en-US",
-            viewport={"width": 1366, "height": 900},
+        browser = await pw.chromium.launch(
+            headless=HEADLESS,
+            args=[
+                "--disable-blink-features=AutomationControlled",
+                "--no-sandbox",
+                "--disable-dev-shm-usage",
+            ],
         )
+        context = await browser.new_context(
+            user_agent=USER_AGENT,
+            locale="en-US",
+            timezone_id="Europe/London",
+            viewport={"width": 1366, "height": 900},
+            extra_http_headers={
+                "Accept-Language": "en-US,en;q=0.9",
+            },
+        )
+        await context.add_init_script(STEALTH_JS)
         page = await context.new_page()
         page.on("response", lambda r: asyncio.create_task(handle_response(r)))
 
         loop = asyncio.get_running_loop()
         pending[1] = loop.create_future()
         print(f"[nav] {URL}")
-        await page.goto(URL, wait_until="domcontentloaded", timeout=NAV_TIMEOUT_MS)
         try:
-            first_body = await asyncio.wait_for(pending[1], timeout=RESPONSE_TIMEOUT_S)
+            await page.goto(URL, wait_until="domcontentloaded",
+                            timeout=NAV_TIMEOUT_MS)
+        except PlaywrightTimeoutError:
+            print("[nav] domcontentloaded timeout — continuing anyway")
+
+        # Give the SvelteKit app time to run its handshake + initial fetch.
+        try:
+            await page.wait_for_load_state("networkidle",
+                                           timeout=NAV_TIMEOUT_MS)
+        except PlaywrightTimeoutError:
+            print("[nav] networkidle timeout — continuing anyway")
+
+        try:
+            first_body = await asyncio.wait_for(
+                pending[1], timeout=RESPONSE_TIMEOUT_S)
         except asyncio.TimeoutError:
+            # Diagnostics dump before failing
+            try:
+                title = await page.title()
+                snippet = (await page.content())[:600]
+            except Exception:
+                title, snippet = "<unavailable>", "<unavailable>"
+            print(f"[diag] title={title!r}")
+            print(f"[diag] html[:600]={snippet!r}")
+            if DEBUG:
+                print("[diag] response URLs seen:")
+                for u in seen_urls:
+                    print(f"  {u}")
             await browser.close()
             raise RuntimeError(
-                "Timed out waiting for the first /api/players/filter response."
+                "Timed out waiting for the first /api/players/filter response. "
+                "The page may be serving a bot-challenge instead of the app. "
+                "Re-run with DEBUG=1 to see all response URLs."
             )
 
         page_count = int((first_body.get("pageData") or {}).get("pageCount", 1))
