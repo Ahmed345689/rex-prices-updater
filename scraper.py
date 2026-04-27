@@ -1,17 +1,14 @@
-import cloudscraper
+import asyncio
 import json
 import logging
 import re
-import time
-from bs4 import BeautifulSoup
 from datetime import datetime
+from playwright.async_api import async_playwright
 
 logging.basicConfig(level=logging.INFO, format='[%(asctime)s] %(levelname)s: %(message)s')
 logger = logging.getLogger(__name__)
 
 SCRAPER_URL = "https://renderz.app/players"
-MAX_RETRIES = 3
-RETRY_DELAY = 2
 
 def parse_price(price_text):
     if not price_text:
@@ -27,32 +24,38 @@ def parse_price(price_text):
     except:
         return None
 
-def find_player_cards(soup):
+async def scrape_players():
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=True)
+        page = await browser.new_page()
+
+        logger.info(f"🚀 Connecting to {SCRAPER_URL}")
+        await page.goto(SCRAPER_URL, wait_until="networkidle", timeout=60000)
+
+        # انتظر الكروت تظهر
+        await page.wait_for_timeout(3000)
+
+        html = await page.content()
+        await browser.close()
+        return html
+
+def parse_players_from_html(html_content):
+    from bs4 import BeautifulSoup
+    soup = BeautifulSoup(html_content, 'lxml')
+
     selectors = [
-        'div[class*="player"]',
-        'div[class*="card"]',
-        'div[class*="PlayerCard"]',
-        'div[class*="market"]',
-        'div[data-testid*="card"]',
-        'a[href*="/player/"]',
-        'div[class*="item"]',
-        'article',
-        'div.bg-gray-800'
+        'div[class*="player"]', 'div[class*="card"]',
+        'div[class*="PlayerCard"]', 'a[href*="/player/"]',
+        'div[class*="item"]', 'article'
     ]
+
+    player_elements = []
     for selector in selectors:
         cards = soup.select(selector)
         if len(cards) > 5:
-            logger.info(f"✅ Found {len(cards)} player cards using selector: {selector}")
-            return cards, selector
-    logger.warning("⚠️ No cards found with known selectors")
-    return [], None
-
-def parse_players_from_html(html_content):
-    soup = BeautifulSoup(html_content, 'lxml')
-    player_elements, used_selector = find_player_cards(soup)
-
-    if not player_elements:
-        return [], 0
+            logger.info(f"✅ Found {len(cards)} cards using: {selector}")
+            player_elements = cards
+            break
 
     players = []
     for idx, card in enumerate(player_elements):
@@ -61,76 +64,43 @@ def parse_players_from_html(html_content):
             price_match = re.search(r'(\d+(?:\.\d+)?[KkMm]|\$?\d{1,3}(?:,\d{3})+)', text)
             if not price_match:
                 continue
-
             price_text = price_match.group(1)
             price = parse_price(price_text)
             if not price or price < 100:
                 continue
-
             name_parts = text.split(price_text)[0].strip().split()
             name = ' '.join(name_parts[-3:]) if name_parts else f"Player_{idx}"
             name = re.sub(r'\d+.*', '', name).strip()
-
             if len(name) > 2:
                 players.append({"name": name, "price": price})
-                logger.info(f" ✓ {name} - ${price:,} (raw: {price_text})")
+                logger.info(f"✓ {name} - ${price:,}")
         except:
             continue
 
-    return players, len(player_elements)
-
-def scrape_with_retry():
-    scraper = cloudscraper.create_scraper(browser={'browser': 'chrome', 'platform': 'windows', 'mobile': False})
-
-    for attempt in range(MAX_RETRIES):
-        try:
-            logger.info(f"🚀 Attempt {attempt + 1}/{MAX_RETRIES}: Connecting to {SCRAPER_URL}")
-            response = scraper.get(SCRAPER_URL, timeout=30)
-            response.raise_for_status()
-
-            players, total_found = parse_players_from_html(response.text)
-
-            if players:
-                logger.info(f"✅ Successfully extracted {len(players)} valid players from {total_found} cards")
-                return players
-            else:
-                logger.warning(f"⚠️ Attempt {attempt + 1}: Found {total_found} cards but 0 valid players")
-
-        except Exception as e:
-            logger.error(f"❌ Attempt {attempt + 1} failed: {e}")
-
-        if attempt < MAX_RETRIES - 1:
-            time.sleep(RETRY_DELAY * (attempt + 1))
-
-    return []
+    return players
 
 def save_to_json(players):
     output = {
         "last_updated": datetime.utcnow().isoformat() + "Z",
-        "source": "fcrenderz.com",
+        "source": "renderz.app",
         "total_players": len(players),
         "players": players
     }
-
     with open('players.json', 'w', encoding='utf-8') as f:
         json.dump(output, f, indent=2, ensure_ascii=False)
-
-    if players:
-        with open('players_backup.json', 'w', encoding='utf-8') as f:
-            json.dump(output, f, indent=2, ensure_ascii=False)
-
     logger.info(f"💾 Saved {len(players)} players to players.json")
 
 if __name__ == "__main__":
-    logger.info("="*50)
+    logger.info("=" * 50)
     logger.info("🎮 FC Renderz Price Scraper Starting")
-    logger.info("="*50)
+    logger.info("=" * 50)
 
-    players = scrape_with_retry()
+    html = asyncio.run(scrape_players())
+    players = parse_players_from_html(html)
     save_to_json(players)
 
     if not players:
-        logger.error("❌ FATAL: No players found. Check selectors or site structure.")
+        logger.error("❌ No players found. Inspect the HTML structure.")
         exit(1)
 
-    logger.info("✅ Scraping completed successfully")
+    logger.info("✅ Done!")
