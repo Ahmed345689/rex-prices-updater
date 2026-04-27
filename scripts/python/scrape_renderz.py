@@ -1,36 +1,5 @@
-
+"""
 Scrape https://renderz.app/24/players using Playwright.
-
-Why Playwright?
-The site is a SvelteKit app. The player list is fetched via
-`POST /api/players/filter`, which is gated by a custom `x-secure-token`
-handshake (`/api/secure-token/init` returns a binary blob decoded by an
-obfuscated JS function). Reproducing that handshake in pure `requests`
-is fragile, so we let a real browser perform it and we just intercept
-the resulting JSON responses.
-
-Strategy:
-  1. Launch headless Chromium.
-  2. Subscribe to `page.on("response", ...)` and capture every JSON body
-     whose URL matches `/api/players/filter`.
-  3. Navigate to /24/players, wait for the first response.
-  4. For each subsequent page, navigate to `?page=N&sortDirection=DESC&sortType=rating`
-     (the route auto-syncs to URL search params, which triggers a new
-     POST /api/players/filter), and capture the response.
-  5. Stop when we've reached the last page (per `pageData.pageCount`)
-     or hit `MAX_PAGES`.
-  6. Extract `name` + `price` for every player and write `players.json`.
-
-Output schema:
-{
-  "scrapedAt": "<ISO8601 UTC>",
-  "season": "24",
-  "totalPlayers": <int>,
-  "players": [
-    {"name": "...", "price": <int|null>, "raw": { ...full original record... }},
-    ...
-  ]
-}
 """
 
 from __future__ import annotations
@@ -52,12 +21,6 @@ MAX_PAGES = int(os.environ.get("MAX_PAGES", "0"))  # 0 = unlimited
 NAV_TIMEOUT_MS = int(os.environ.get("NAV_TIMEOUT_MS", "60000"))
 RESPONSE_TIMEOUT_S = float(os.environ.get("RESPONSE_TIMEOUT_S", "45"))
 HEADLESS = os.environ.get("HEADLESS", "1") not in ("0", "false", "False", "")
-
-
-# ---------------------------------------------------------------------------
-# Helpers to extract a name + price out of a player record without knowing
-# the exact schema upfront.
-# ---------------------------------------------------------------------------
 
 NAME_KEYS = (
     "name", "commonName", "displayName", "fullName",
@@ -89,7 +52,6 @@ def extract_name(record: dict) -> str | None:
     last = _first_present(record, LAST_KEYS)
     if first or last:
         return " ".join(p for p in (first, last) if p)
-    # Some APIs nest the player inside `player` / `card` / `details`
     for nest in ("player", "card", "details", "data"):
         sub = record.get(nest)
         if isinstance(sub, dict):
@@ -102,7 +64,6 @@ def extract_name(record: dict) -> str | None:
 def extract_price(record: dict) -> int | None:
     val = _first_present(record, PRICE_KEYS)
     if val is None:
-        # Sometimes nested under `prices` or `market`
         for nest in ("prices", "market", "auction", "player", "card"):
             sub = record.get(nest)
             if isinstance(sub, dict):
@@ -111,7 +72,6 @@ def extract_price(record: dict) -> int | None:
                     return v
         return None
     if isinstance(val, dict):
-        # e.g. {"current": 12345}
         for k in ("current", "value", "amount", "lowest", "buyNow"):
             if k in val:
                 val = val[k]
@@ -122,12 +82,8 @@ def extract_price(record: dict) -> int | None:
         return None
 
 
-# ---------------------------------------------------------------------------
-# Main scrape
-# ---------------------------------------------------------------------------
-
 async def scrape() -> dict:
-    captured: dict[int, dict] = {}  # page_number -> json body
+    captured: dict[int, dict] = {}
     pending: dict[int, asyncio.Future] = {}
 
     async def handle_response(response: Response) -> None:
@@ -151,7 +107,9 @@ async def scrape() -> dict:
             print(f"[response] page {current}/{total_pages}, "
                   f"{len(players)} players, total={row_count}")
             captured[int(current)] = body
-fut.set_result(body)
+            fut = pending.pop(int(current), None)
+            if fut and not fut.done():
+                fut.set_result(body)
         except Exception as e:
             print(f"[response] handler error: {e}")
 
@@ -168,7 +126,6 @@ fut.set_result(body)
         page = await context.new_page()
         page.on("response", lambda r: asyncio.create_task(handle_response(r)))
 
-        # 1) First page — register the future BEFORE navigation
         loop = asyncio.get_running_loop()
         pending[1] = loop.create_future()
         print(f"[nav] {URL}")
@@ -178,15 +135,13 @@ fut.set_result(body)
         except asyncio.TimeoutError:
             await browser.close()
             raise RuntimeError(
-                "Timed out waiting for the first /api/players/filter response. "
-                "The page may have changed or be blocked."
+                "Timed out waiting for the first /api/players/filter response."
             )
 
         page_count = int((first_body.get("pageData") or {}).get("pageCount", 1))
         row_count = (first_body.get("pageData") or {}).get("rowCount")
         print(f"[info] pageCount={page_count} rowCount={row_count}")
 
-        # 2) Walk remaining pages by navigating with ?page=N
         last_page = page_count
         if MAX_PAGES > 0:
             last_page = min(last_page, MAX_PAGES)
@@ -209,7 +164,6 @@ fut.set_result(body)
 
         await browser.close()
 
-    # 3) Flatten the captured pages into a single ordered list of players
     flat: list[dict] = []
     for page_num in sorted(captured):
         body = captured[page_num]
