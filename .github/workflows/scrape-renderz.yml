@@ -1,4 +1,4 @@
-name: Scrape RenderZ Players
+name: Scrape players
 
 on:
   workflow_dispatch:
@@ -56,10 +56,24 @@ jobs:
           python scripts/python/summarize_players.py players.json
 
       - name: Upload players.json artifact
+        if: success()
         uses: actions/upload-artifact@v4
         with:
           name: players-json
           path: players.json
+          retention-days: 14
+
+      - name: Upload debug artifacts on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug-on-failure
+          path: |
+            debug_screenshot.png
+            debug_page.html
+            debug_info.json
+            players.json
+          if-no-files-found: ignore
           retention-days: 14
 
       # OPTIONAL: commit the result back to the repo on the default branch.
