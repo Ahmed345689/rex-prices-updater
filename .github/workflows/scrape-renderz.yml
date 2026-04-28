@@ -1,5 +1,8 @@
 name: Scrape players
 
+permissions:
+  contents: write
+
 on:
   workflow_dispatch:
     inputs:
@@ -36,31 +39,32 @@ jobs:
 
       - name: Run scraper
         env:
-          OUTPUT_FILE: players.json
+          OUTPUT_FILE: assets/players.json
           MAX_PAGES: ${{ github.event.inputs.max_pages || '0' }}
           HEADLESS: "1"
           NAV_TIMEOUT_MS: "90000"
-          RESPONSE_TIMEOUT_S: "90"
+          RESPONSE_TIMEOUT_S: "120"
           DEBUG: "1"
         run: |
+          mkdir -p assets
           python scripts/python/scrape_renderz.py
 
       - name: Show summary
         if: always()
         run: |
-          if [ ! -f players.json ]; then
-            echo "No players.json was produced."
+          if [ ! -f assets/players.json ]; then
+            echo "No assets/players.json was produced."
             exit 1
           fi
-          echo "players.json size: $(wc -c < players.json) bytes"
-          python scripts/python/summarize_players.py players.json
+          echo "players.json size: $(wc -c < assets/players.json) bytes"
+          python scripts/python/summarize_players.py assets/players.json
 
       - name: Upload players.json artifact
         if: success()
         uses: actions/upload-artifact@v4
         with:
           name: players-json
-          path: players.json
+          path: assets/players.json
           retention-days: 14
 
       - name: Upload debug artifacts on failure
@@ -83,10 +87,14 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add players.json
+          # remove old root-level players.json from prior runs (if any)
+          if [ -f players.json ] && [ ! -L players.json ]; then
+            git rm -f players.json || true
+          fi
+          git add assets/players.json
           if git diff --cached --quiet; then
             echo "No changes to commit."
           else
-            git commit -m "chore(data): refresh players.json [skip ci]"
+            git commit -m "chore(data): refresh assets/players.json [skip ci]"
             git push
           fi
