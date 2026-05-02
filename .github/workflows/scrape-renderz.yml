@@ -25,9 +25,9 @@ on:
 
 jobs:
   scrape:
-    name: Scrape players (season ${{ github.event.inputs.season || '25' }})
+    name: Scrape players (season ${{ github.event.inputs.season || '24' }})
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 360
 
     steps:
       - name: Checkout repository
@@ -46,7 +46,7 @@ jobs:
 
       - name: Run scraper
         env:
-          SEASON: ${{ github.event.inputs.season || '25' }}
+          SEASON: ${{ github.event.inputs.season || '24' }}
           OUTPUT_FILE: assets/data/players.json
           MAX_PAGES: ${{ github.event.inputs.max_pages || '0' }}
           HEADLESS: "1"
@@ -80,7 +80,7 @@ jobs:
         if: success()
         uses: actions/upload-artifact@v4
         with:
-          name: players-json-season-${{ github.event.inputs.season || '25' }}
+          name: players-json-season-${{ github.event.inputs.season || '24' }}
           path: assets/data/players.json
           retention-days: 30
 
@@ -109,7 +109,7 @@ jobs:
           if git diff --cached --quiet; then
             echo "No changes to commit — data is already up to date."
           else
-            SEASON="${{ github.event.inputs.season || '25' }}"
+            SEASON="${{ github.event.inputs.season || '24' }}"
             TOTAL=$(python -c "import json; d=json.load(open('assets/data/players.json')); print(d.get('totalPlayers',0))")
             git commit -m "chore(data): season ${SEASON} — ${TOTAL} players [skip ci]"
             git push
