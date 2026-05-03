@@ -77,7 +77,7 @@ jobs:
           echo "OK: ${TOTAL} players captured."
 
       - name: Upload players.json artifact
-        if: success()
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: players-json-season-${{ github.event.inputs.season || '24' }}
