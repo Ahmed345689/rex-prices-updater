@@ -21,7 +21,7 @@ on:
   schedule:
     # Every Monday at 04:00 UTC — weekly is enough since player data
     # doesn't change that frequently. Change to "0 4 * * *" for daily.
-    - cron: "0 4 * * 1"
+    - cron: "0 4 * * *"
 
 jobs:
   scrape:
