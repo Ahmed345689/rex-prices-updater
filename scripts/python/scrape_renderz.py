@@ -1,8 +1,8 @@
 """
-scrape_renderz.py — Nexus FC Mobile Scraper v7.1 (Auto-Fix Edition)
+scrape_renderz.py — Nexus FC Mobile Scraper v7.2 (Deep-Scan Edition)
 
-الجديد في v7.1:
-  - إصلاح خطأ 404 عبر البحث الديناميكي عن الـ JS bundle من الصفحة الرئيسية.
+الجديد في v7.2:
+  - إصلاح فحص الـ JS عبر الدخول مباشرة لملف الـ Entry/Manifest الخاص بـ SvelteKit.
   - بدون Playwright نهائياً — يعمل بـ requests فقط.
 """
 from __future__ import annotations
@@ -31,63 +31,76 @@ HEADERS = {
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
         "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
     ),
-    "Accept":   "application/json",
-    "Origin":   BASE_URL,
-    "Referer":  f"{BASE_URL}/{SEASON}/players",
+    "Accept":   "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.5",
 }
 
 # ── Dynamic Bundle Finder ───────────────────────────────────────────────────────
 
 def get_dynamic_js_url() -> str:
-    """تدخل على الموقع وتبحث عن رابط ملف الـ JS الحالي الذي يحتوي على الخرائط الترجيمية."""
-    print("[maps] جاري فحص الصفحة الرئيسية للبحث عن الـ JS bundle الجديد...")
+    """تبحث في كود الصفحة وتستخرج ملفات الـ JS، وإذا فشلت تبحث في الـ entry script"""
+    print("[maps] جاري فحص الصفحة الرئيسية بحثاً عن مسارات الجافاسكريبت الحالية...")
     session = requests.Session()
+    valid_urls = []
+    
     try:
-        # الدخول لصفحة اللاعبين للبحث عن مسارات ملفات الجافاسكريبت المرفقة
+        # المحاولة 1: الدخول لصفحة اللاعبين وقراءة الكود بالكامل
         target_url = f"{BASE_URL}/{SEASON}/players"
         r = session.get(target_url, headers=HEADERS, timeout=30)
         r.raise_for_status()
         
-        # البحث عن الأنماط الشائعة لملفات الـ chunks في سورس الصفحة
-        # يبحث عن صيغة مثل: /_app/immutable/chunks/اسم-الملف.js
-        chunks = re.findall(r'[^"\']*/_app/immutable/chunks/[A-Za-z0-9_$-]+\.js', r.text)
+        # البحث عن أي روابط جافاسكريبت تنتهي بـ .js جوة الـ chunks
+        chunks = re.findall(r'/_app/immutable/chunks/[A-Za-z0-9_$-]+\.js', r.text)
         
-        if not chunks:
-            # محاولة أخرى للبحث داخل كود الـ HTML نفسه في حال كان المسار نسبياً ومختلفاً
-            chunks = re.findall(r'href=["\'](.*?/chunks/.*?\.js)["\']', r.text)
+        # تحسين البحث ليلقط الصيغ الأخرى للـ imports
+        chunks += re.findall(r'src=["\'](.*?/chunks/.*?\.js)["\']', r.text)
+        chunks += re.findall(r'href=["\'](.*?/chunks/.*?\.js)["\']', r.text)
 
-        # تنظيف الروابط والتأكد من أنها تبدأ بـ BASE_URL
-        valid_urls = []
         for c in chunks:
-            full_url = c if c.startswith("http") else f"{BASE_URL}{c}"
+            full_url = c if c.startswith("http") else f"{BASE_URL}{c if c.startswith('/') else '/' + c}"
             if full_url not in valid_urls:
                 valid_urls.append(full_url)
+                
+        # المحاولة 2: إذا لم نجد ملفات، نبحث عن ملف الـ start أو entry في السورس
+        if not valid_urls:
+            print("[maps] لم نجد روابط مباشرة، جاري البحث عن ملف الـ entry script...")
+            entry_match = re.search(r'/_app/immutable/entry/start\.[A-Za-z0-9_-]+\.js', r.text)
+            if entry_match:
+                entry_url = f"{BASE_URL}{entry_match.group(0)}"
+                print(f"[maps] فحص ملف الـ Entry: {entry_url}")
+                entry_res = session.get(entry_url, headers=HEADERS, timeout=20)
+                if entry_res.status_code == 200:
+                    # استخراج كل أسماء الـ chunks المذكورة داخل ملف الـ start
+                    more_chunks = re.findall(r'[A-Za-z0-9_$-]+\.js', entry_res.text)
+                    for mc in more_chunks:
+                        if len(mc) > 10:  # تخطي الأسماء القصيرة جداً غير الصالحة
+                            url = f"{BASE_URL}/_app/immutable/chunks/{mc}"
+                            if url not in valid_urls:
+                                valid_urls.append(url)
 
-        print(f"[maps] تم العثور على {len(valid_urls)} ملف JS محتمل.")
+        print(f"[maps] إجمالي الملفات المكتشفة للفحص: {len(valid_urls)}")
         
-        # هنمر على الملفات ونبحث عن الملف اللي جواه الـ Translation Tables
+        # التمرير على الملفات للبحث عن مصفوفة الترجمة
         for url in valid_urls:
             try:
-                print(f"[maps] فحص الملف: {url.split('/')[-1]} ...")
-                res = session.get(url, headers=HEADERS, timeout=15)
-                if res.status_code == 200 and "NationName_" in res.text:
-                    print(f"[maps] 🎉 تم العثور على الملف الصحيح بنجاح!")
+                res = session.get(url, headers=HEADERS, timeout=10)
+                if res.status_code == 200 and ("NationName_" in res.text or "ClubName_" in res.text):
+                    print(f"[maps] 🎉 نجاح! تم العثور على الملف الصحيح: {url.split('/')[-1]}")
                     return url
             except Exception:
                 continue
                 
     except Exception as e:
-        print(f"[maps] ⚠️ فشل البحث الديناميكي بسبب: {e}")
+        print(f"[maps] ⚠️ خطأ أثناء البحث الديناميكي: {e}")
     
-    # حل احتياطي إذا فشل البحث التلقائي (يرجع لأقرب افتراض معروف)
-    return f"{BASE_URL}/_app/immutable/chunks/DwqjCHAg.js"
+    # حل أخير في حالة الفشل التام
+    raise RuntimeError("⚠️ فشل السكرابر في العثور على ملف خرائط الأسماء (JS Bundle) بعد التحديث الجديد للموقع.")
 
 
 # ── Name Extractor ──────────────────────────────────────────────────────────────
 
 def extract_name_maps(src: str) -> tuple[dict, dict, dict]:
     """يستخرج الأسماء الحقيقية للدول/الفرق/الدوريات من الـ JS bundle."""
-    # Step 1: key → outer_var
     key_to_var: dict[str, str] = {}
     for m in re.finditer(
         r'((?:NationName|TeamName|LeagueName|ClubName)_(\d+)):([A-Za-z_$][A-Za-z0-9_$]{1,8})',
@@ -95,7 +108,6 @@ def extract_name_maps(src: str) -> tuple[dict, dict, dict]:
     ):
         key_to_var[m.group(1)] = m.group(3)
 
-    # Step 2: outer_var → en_var
     var_to_en: dict[str, str] = {}
     for m in re.finditer(
         r'([A-Za-z_$][A-Za-z0-9_$]{1,8})=\([^)]{0,20}\)=>\(\{"da-DK":[^,]+,"de-DE":[^,]+,"en-US":([A-Za-z_$][A-Za-z0-9_$]{1,8})',
@@ -103,7 +115,6 @@ def extract_name_maps(src: str) -> tuple[dict, dict, dict]:
     ):
         var_to_en[m.group(1)] = m.group(2)
 
-    # Step 3: en_var → English name
     en_to_name: dict[str, str] = {}
     for m in re.finditer(
         r'(?:^|[,;=\s])([A-Za-z_$][A-Za-z0-9_$]{1,8})=\(\)=>"([^"]{1,80})"',
@@ -111,7 +122,6 @@ def extract_name_maps(src: str) -> tuple[dict, dict, dict]:
     ):
         en_to_name[m.group(1)] = m.group(2)
 
-    # Step 4: build final maps
     nations: dict[int, str] = {}
     clubs:   dict[int, str] = {}
     leagues: dict[int, str] = {}
@@ -138,7 +148,7 @@ def load_name_maps() -> tuple[dict, dict, dict]:
     """يجيب الـ JS bundle الديناميكي ويستخرج الأسماء."""
     js_url = get_dynamic_js_url()
     print(f"[maps] جاري تحميل الـ JS bundle من {js_url} ...")
-    r = requests.get(js_url, headers={"User-Agent": HEADERS["User-Agent"]}, timeout=60)
+    r = requests.get(js_url, headers=HEADERS, timeout=60)
     r.raise_for_status()
     src = r.text
     print(f"[maps] حجم الـ bundle: {len(src):,} chars — جاري الاستخراج ...")
@@ -150,7 +160,6 @@ def load_name_maps() -> tuple[dict, dict, dict]:
 # ── Player Parser ───────────────────────────────────────────────────────────────
 
 def _resolve_id(placeholder: str) -> int | None:
-    """يستخرج الـ ID من NationName_52 → 52"""
     parts = placeholder.rsplit("_", 1)
     if len(parts) == 2:
         try:
@@ -166,7 +175,6 @@ def parse_player(
     clubs:   dict[int, str],
     leagues: dict[int, str],
 ) -> dict:
-    """يحوّل سجل لاعب خام إلى dict نظيف مع الأسماء الحقيقية."""
     nation_id  = _resolve_id(raw.get("nationName", ""))
     club_id    = _resolve_id(raw.get("clubName",   ""))
     league_id  = _resolve_id(raw.get("leagueName", ""))
@@ -229,7 +237,6 @@ def parse_player(
 # ── Scraper ─────────────────────────────────────────────────────────────────────
 
 def fetch_page(session: requests.Session, page: int) -> dict:
-    """يجيب صفحة واحدة من الـ players API مع retry تلقائي."""
     payload = {
         "filters":       {},
         "seasonId":      INTERNAL_ID,
@@ -238,6 +245,10 @@ def fetch_page(session: requests.Session, page: int) -> dict:
         "sortDirection": SORT_DIR,
         "gkStats":       False,
     }
+    HEADERS["Origin"] = BASE_URL
+    HEADERS["Referer"] = f"{BASE_URL}/{SEASON}/players"
+    HEADERS["Accept"] = "application/json"
+    
     for attempt in range(4):
         try:
             r = session.post(PLAYERS_API, headers=HEADERS, json=payload, timeout=45)
