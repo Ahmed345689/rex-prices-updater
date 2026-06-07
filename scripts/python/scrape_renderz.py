@@ -1,13 +1,9 @@
 """
-scrape_renderz.py — Nexus FC Mobile Scraper v7
+scrape_renderz.py — Nexus FC Mobile Scraper v7.1 (Auto-Fix Edition)
 
-الجديد في v7:
-  - بدون Playwright نهائياً — يعمل بـ requests فقط
-  - يستخرج الأسماء الحقيقية للدول/الفرق/الدوريات من الـ JS bundle مباشرة
-  - يجيب بيانات اللاعبين من POST /api/players/filter
-  - سريع جداً ومتوافق مع أي بيئة
-  - يدعم MAX_PLAYERS للاختبار السريع
-  - يطبع progress كل 100 لاعب
+الجديد في v7.1:
+  - إصلاح خطأ 404 عبر البحث الديناميكي عن الـ JS bundle من الصفحة الرئيسية.
+  - بدون Playwright نهائياً — يعمل بـ requests فقط.
 """
 from __future__ import annotations
 
@@ -28,29 +24,69 @@ SORT_TYPE       = os.environ.get("SORT_TYPE", "overallRating")
 SORT_DIR        = os.environ.get("SORT_DIR", "DESC")
 
 BASE_URL        = "https://renderz.app"
-JS_CHUNK_URL    = f"{BASE_URL}/_app/immutable/chunks/DwqjCHAg.js"
 PLAYERS_API     = f"{BASE_URL}/api/players/filter"
 
 HEADERS = {
     "User-Agent": (
-        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
     ),
     "Accept":   "application/json",
     "Origin":   BASE_URL,
     "Referer":  f"{BASE_URL}/{SEASON}/players",
 }
 
+# ── Dynamic Bundle Finder ───────────────────────────────────────────────────────
+
+def get_dynamic_js_url() -> str:
+    """تدخل على الموقع وتبحث عن رابط ملف الـ JS الحالي الذي يحتوي على الخرائط الترجيمية."""
+    print("[maps] جاري فحص الصفحة الرئيسية للبحث عن الـ JS bundle الجديد...")
+    session = requests.Session()
+    try:
+        # الدخول لصفحة اللاعبين للبحث عن مسارات ملفات الجافاسكريبت المرفقة
+        target_url = f"{BASE_URL}/{SEASON}/players"
+        r = session.get(target_url, headers=HEADERS, timeout=30)
+        r.raise_for_status()
+        
+        # البحث عن الأنماط الشائعة لملفات الـ chunks في سورس الصفحة
+        # يبحث عن صيغة مثل: /_app/immutable/chunks/اسم-الملف.js
+        chunks = re.findall(r'[^"\']*/_app/immutable/chunks/[A-Za-z0-9_$-]+\.js', r.text)
+        
+        if not chunks:
+            # محاولة أخرى للبحث داخل كود الـ HTML نفسه في حال كان المسار نسبياً ومختلفاً
+            chunks = re.findall(r'href=["\'](.*?/chunks/.*?\.js)["\']', r.text)
+
+        # تنظيف الروابط والتأكد من أنها تبدأ بـ BASE_URL
+        valid_urls = []
+        for c in chunks:
+            full_url = c if c.startswith("http") else f"{BASE_URL}{c}"
+            if full_url not in valid_urls:
+                valid_urls.append(full_url)
+
+        print(f"[maps] تم العثور على {len(valid_urls)} ملف JS محتمل.")
+        
+        # هنمر على الملفات ونبحث عن الملف اللي جواه الـ Translation Tables
+        for url in valid_urls:
+            try:
+                print(f"[maps] فحص الملف: {url.split('/')[-1]} ...")
+                res = session.get(url, headers=HEADERS, timeout=15)
+                if res.status_code == 200 and "NationName_" in res.text:
+                    print(f"[maps] 🎉 تم العثور على الملف الصحيح بنجاح!")
+                    return url
+            except Exception:
+                continue
+                
+    except Exception as e:
+        print(f"[maps] ⚠️ فشل البحث الديناميكي بسبب: {e}")
+    
+    # حل احتياطي إذا فشل البحث التلقائي (يرجع لأقرب افتراض معروف)
+    return f"{BASE_URL}/_app/immutable/chunks/DwqjCHAg.js"
+
+
 # ── Name Extractor ──────────────────────────────────────────────────────────────
 
 def extract_name_maps(src: str) -> tuple[dict, dict, dict]:
-    """
-    يستخرج الأسماء الحقيقية للدول/الفرق/الدوريات من الـ JS bundle.
-    هيكل الـ bundle:
-      1. i18n table: NationName_52:XPb, ...
-      2. localized fn: XPb=(e,a)=>({"en-US": Tu, ...})[lang]()
-      3. english fn:   Tu=()=>"Argentina"
-    """
+    """يستخرج الأسماء الحقيقية للدول/الفرق/الدوريات من الـ JS bundle."""
     # Step 1: key → outer_var
     key_to_var: dict[str, str] = {}
     for m in re.finditer(
@@ -99,9 +135,10 @@ def extract_name_maps(src: str) -> tuple[dict, dict, dict]:
 
 
 def load_name_maps() -> tuple[dict, dict, dict]:
-    """يجيب الـ JS bundle ويستخرج الأسماء."""
-    print(f"[maps] جاري تحميل الـ JS bundle من {JS_CHUNK_URL} ...")
-    r = requests.get(JS_CHUNK_URL, headers={"User-Agent": HEADERS["User-Agent"]}, timeout=60)
+    """يجيب الـ JS bundle الديناميكي ويستخرج الأسماء."""
+    js_url = get_dynamic_js_url()
+    print(f"[maps] جاري تحميل الـ JS bundle من {js_url} ...")
+    r = requests.get(js_url, headers={"User-Agent": HEADERS["User-Agent"]}, timeout=60)
     r.raise_for_status()
     src = r.text
     print(f"[maps] حجم الـ bundle: {len(src):,} chars — جاري الاستخراج ...")
@@ -130,8 +167,6 @@ def parse_player(
     leagues: dict[int, str],
 ) -> dict:
     """يحوّل سجل لاعب خام إلى dict نظيف مع الأسماء الحقيقية."""
-
-    # الأسماء
     nation_id  = _resolve_id(raw.get("nationName", ""))
     club_id    = _resolve_id(raw.get("clubName",   ""))
     league_id  = _resolve_id(raw.get("leagueName", ""))
@@ -140,11 +175,8 @@ def parse_player(
     club_name    = clubs.get(club_id,      raw.get("clubName",    "")) if club_id    is not None else raw.get("clubName",    "")
     league_name  = leagues.get(league_id,  raw.get("leagueName",  "")) if league_id  is not None else raw.get("leagueName",  "")
 
-    # الـ stats
     avg   = raw.get("avgStats", {})
     stats = raw.get("stats", {})
-
-    # الـ images
     imgs = raw.get("images", {})
 
     return {
@@ -206,7 +238,7 @@ def fetch_page(session: requests.Session, page: int) -> dict:
         "sortDirection": SORT_DIR,
         "gkStats":       False,
     }
-    for attempt in range(4):  # 4 محاولات
+    for attempt in range(4):
         try:
             r = session.post(PLAYERS_API, headers=HEADERS, json=payload, timeout=45)
             r.raise_for_status()
@@ -288,7 +320,6 @@ def scrape() -> None:
     OUTPUT_FILE.write_text(json.dumps(output, ensure_ascii=False), encoding="utf-8")
     print(f"\n[scraper] 💾  حُفظ {len(players):,} لاعب في {OUTPUT_FILE}")
 
-    # إحصائيات الأسماء
     def _name(val):
         if isinstance(val, dict): return val.get("name") or ""
         return str(val) if val else ""
@@ -301,8 +332,6 @@ def scrape() -> None:
     print(f"[stats] أندية حقيقية: {real_clubs}/{total} ({real_clubs/total*100:.1f}%)")
     print(f"[stats] دوريات حقيقية:{real_leagues}/{total} ({real_leagues/total*100:.1f}%)")
 
-
-# ── Entry point ─────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     scrape()
