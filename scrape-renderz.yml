@@ -1,0 +1,82 @@
+name: Scrape players
+
+permissions:
+  contents: write
+
+on:
+  workflow_dispatch:
+    inputs:
+      season:
+        description: "FIFA season number"
+        required: false
+        default: "24"
+      max_pages:
+        description: "Maximum pages (0 = all)"
+        required: false
+        default: "0"
+      min_players:
+        description: "Fail if fewer than this many players"
+        required: false
+        default: "50"
+  schedule:
+    - cron: "0 */8 * * *"
+
+jobs:
+  scrape:
+    name: Scrape players (season ${{ github.event.inputs.season || '24' }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          pip install requests
+
+      - name: Run scraper
+        env:
+          SEASON: ${{ github.event.inputs.season || '24' }}
+          OUTPUT_FILE: assets/data/players.json
+          MAX_PAGES: ${{ github.event.inputs.max_pages || '0' }}
+        run: |
+          mkdir -p assets/data/chunks
+          python scripts/python/scrape_renderz.py
+
+      - name: Validate output
+        env:
+          MIN_PLAYERS: ${{ github.event.inputs.min_players || '50' }}
+        run: |
+          if [ ! -f assets/data/players.json ]; then
+            echo "ERROR: players.json not found"
+            exit 1
+          fi
+          TOTAL=$(python -c "import json; d=json.load(open('assets/data/players.json')); print(d.get('meta',{}).get('totalPlayers',0) or len(d.get('players',[])))")
+          echo "Total players: ${TOTAL}"
+          if [ "${TOTAL}" -lt "${MIN_PLAYERS}" ]; then
+            echo "ERROR: Only ${TOTAL} players"
+            exit 1
+          fi
+          CHUNKS=$(ls assets/data/chunks/ | wc -l)
+          echo "Chunks created: ${CHUNKS}"
+          echo "Index file: $(cat assets/data/players_index.json | python -c 'import json,sys; d=json.load(sys.stdin); print(f"{d[\"totalChunks\"]} chunks, {d[\"totalPlayers\"]} players')")"
+
+      - name: Commit updated data
+        if: always()
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add assets/data/players.json assets/data/players_index.json assets/data/chunks/
+          if git diff --cached --quiet; then
+            echo "No changes to commit"
+          else
+            TOTAL=$(python -c "import json; d=json.load(open('assets/data/players.json')); print(d.get('meta',{}).get('totalPlayers',0) or len(d.get('players',[])))")
+            git commit -m "chore(data): ${TOTAL} players + chunks [skip ci]"
+            git push
+          fi
