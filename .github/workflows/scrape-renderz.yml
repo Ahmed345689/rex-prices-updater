@@ -7,18 +7,20 @@ on:
   workflow_dispatch:
     inputs:
       season:
-        description: "FIFA season number"
+        description: "FIFA season number (24 = FC 24/25, the current season)"
         required: false
         default: "24"
       max_pages:
-        description: "Maximum pages (0 = all)"
+        description: "Maximum pages to scrape (0 = all)"
         required: false
         default: "0"
       min_players:
-        description: "Fail if fewer than this many players"
+        description: "Fail if fewer than this many players are captured"
         required: false
         default: "50"
   schedule:
+    # Every Monday at 04:00 UTC — weekly is enough since player data
+    # doesn't change that frequently. Change to "0 4 * * *" for daily.
     - cron: "0 */8 * * *"
 
 jobs:
@@ -36,47 +38,79 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install dependencies
+      - name: Install Playwright + dependencies
         run: |
-          pip install requests
+          python -m pip install --upgrade pip
+          pip install playwright requests
+          playwright install --with-deps chromium
 
       - name: Run scraper
         env:
           SEASON: ${{ github.event.inputs.season || '24' }}
           OUTPUT_FILE: assets/data/players.json
           MAX_PAGES: ${{ github.event.inputs.max_pages || '0' }}
+          HEADLESS: "1"
+          NAV_TIMEOUT_MS: "90000"
+          RESPONSE_TIMEOUT_S: "120"
+          DEBUG: "1"
         run: |
-          mkdir -p assets/data/chunks
+          mkdir -p assets/data
           python scripts/python/scrape_renderz.py
 
-      - name: Validate output
+      - name: Validate & summarize output
         env:
           MIN_PLAYERS: ${{ github.event.inputs.min_players || '50' }}
         run: |
           if [ ! -f assets/data/players.json ]; then
-            echo "ERROR: players.json not found"
+            echo "ERROR: assets/data/players.json was not produced."
             exit 1
           fi
-          TOTAL=$(python -c "import json; d=json.load(open('assets/data/players.json')); print(d.get('meta',{}).get('totalPlayers',0) or len(d.get('players',[])))")
-          echo "Total players: ${TOTAL}"
+          echo "players.json size: $(wc -c < assets/data/players.json) bytes"
+          python scripts/python/summarize_players.py assets/data/players.json
+          TOTAL=$(python -c "import json; d=json.load(open('assets/data/players.json')); print(d.get('totalPlayers',0))")
+          echo "Total players captured: ${TOTAL}"
           if [ "${TOTAL}" -lt "${MIN_PLAYERS}" ]; then
-            echo "ERROR: Only ${TOTAL} players"
+            echo "ERROR: Only ${TOTAL} players captured, minimum required is ${MIN_PLAYERS}."
+            echo "Check debug artifacts below to see what went wrong."
             exit 1
           fi
-          CHUNKS=$(ls assets/data/chunks/ | wc -l)
-          echo "Chunks created: ${CHUNKS}"
-          echo "Index file: $(cat assets/data/players_index.json | python -c 'import json,sys; d=json.load(sys.stdin); print(f"{d[\"totalChunks\"]} chunks, {d[\"totalPlayers\"]} players')")"
+          echo "OK: ${TOTAL} players captured."
 
-      - name: Commit updated data
+      - name: Upload players.json artifact
         if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: players-json-season-${{ github.event.inputs.season || '24' }}
+          path: assets/data/players.json
+          retention-days: 30
+
+      - name: Upload debug artifacts on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug-on-failure
+          path: |
+            debug_screenshot.png
+            debug_page.html
+            debug_info.json
+            players.json
+          if-no-files-found: ignore
+          retention-days: 14
+
+      - name: Commit updated players.json
+        if: always() && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add assets/data/players.json assets/data/players_index.json assets/data/chunks/
+          if [ -f players.json ] && [ ! -L players.json ]; then
+            git rm -f players.json || true
+          fi
+          git add assets/data/players.json
           if git diff --cached --quiet; then
-            echo "No changes to commit"
+            echo "No changes to commit — data is already up to date."
           else
-            TOTAL=$(python -c "import json; d=json.load(open('assets/data/players.json')); print(d.get('meta',{}).get('totalPlayers',0) or len(d.get('players',[])))")
-            git commit -m "chore(data): ${TOTAL} players + chunks [skip ci]"
+            SEASON="${{ github.event.inputs.season || '24' }}"
+            TOTAL=$(python -c "import json; d=json.load(open('assets/data/players.json')); print(d.get('totalPlayers',0))")
+            git commit -m "chore(data): season ${SEASON} — ${TOTAL} players [skip ci]"
             git push
           fi
